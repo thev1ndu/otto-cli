@@ -84,7 +84,6 @@ const git = {
     }
   },
 
-  // Calculates behind count relative to a specific target (e.g. origin/main)
   commitsBehind: (target) => {
     try {
       return sh(`git rev-list --count HEAD..${target}`, true);
@@ -93,15 +92,13 @@ const git = {
     }
   },
 
-  // NEW: Checks if CURRENT branch has upstream updates
   upstreamBehindCount: () => {
     if (!git.isRepo()) return 0;
     try {
-        // Ensure upstream exists (@{u}) and count commits between HEAD and upstream
-        const count = sh("git rev-list --count HEAD..@{u}", true);
-        return parseInt(count) || 0;
+      const count = sh("git rev-list --count HEAD..@{u}", true);
+      return parseInt(count) || 0;
     } catch {
-        return 0; // No upstream or other error
+      return 0;
     }
   },
 
@@ -112,12 +109,34 @@ const git = {
 
   rawDiff: () => sh("git diff --cached", true),
 
+  // Auto-stash for switching branches
   stash: () => {
     if (!git.isRepo()) return false;
     const isDirty = sh("git status --porcelain", true).length > 0;
     if (!isDirty) return false;
     sh('git stash push -m "Otto Auto-Switch"', true);
     return true;
+  },
+
+  // Manual stash with message
+  stashSave: (msg = "Otto Stash") => {
+    const isDirty = sh("git status --porcelain", true).length > 0;
+    if (!isDirty) throw new Error("No local changes to stash");
+    sh(`git stash push -m "${msg}"`);
+    return true;
+  },
+
+  // List all stashes
+  stashList: () => {
+    const out = sh("git stash list", true);
+    if (!out) return [];
+    // Output: stash@{0}: On main: message...
+    return out.split("\n").map((line) => {
+      const firstColon = line.indexOf(":");
+      const ref = line.substring(0, firstColon);
+      const msg = line.substring(firstColon + 1).trim();
+      return { ref, msg };
+    });
   },
 
   pop: () => {
@@ -155,9 +174,18 @@ const ui = {
 
     const user = git.user();
     const br = git.branch();
-    
+
     console.log(pc.dim(`👋 Hello, ${user} (on ${pc.cyan(br)})`));
     console.log(pc.dim(`🔧 Using: ${PM}`));
+
+    // --- Services Check ---
+    const services = [];
+    if (process.env.OPENAI_API_KEY) services.push("🤖 AI");
+    if (process.env.GOOGLE_SHEET_WEBHOOK_URL) services.push("📊 Sheets");
+
+    if (services.length > 0) {
+      console.log(pc.dim(`⚡ Services: ${services.join(" + ")}`));
+    }
 
     if (!git.isRepo()) {
       note("You're not inside a git repository.", "ℹ Git");
@@ -165,32 +193,38 @@ const ui = {
     }
 
     const defaultBr = git.defaultBranch();
-    
+
     if (defaultBr) {
-        console.log(pc.dim("─".repeat(50)));
-        
-        const defInfo = git.commitInfo(defaultBr);
-        if (defInfo) {
-            console.log(
-                `${pc.green("🌿 " + defaultBr.padEnd(12))} ` + 
-                `${pc.dim(defInfo.hash)} ${pc.white(defInfo.msg.substring(0, 40))} ${pc.dim("(" + defInfo.time + ")")}`
-            );
-        }
+      console.log(pc.dim("─".repeat(50)));
 
-        const headInfo = git.commitInfo("HEAD");
-        if (headInfo) {
-            console.log(
-                `${pc.blue("📍 HEAD".padEnd(13))} ` + 
-                `${pc.dim(headInfo.hash)} ${pc.white(headInfo.msg.substring(0, 40))} ${pc.dim("(" + headInfo.time + ")")}`
-            );
-        }
+      const defInfo = git.commitInfo(defaultBr);
+      if (defInfo) {
+        console.log(
+          `${pc.green("🌿 " + defaultBr.padEnd(12))} ` +
+            `${pc.dim(defInfo.hash)} ${pc.white(
+              defInfo.msg.substring(0, 40)
+            )} ${pc.dim("(" + defInfo.time + ")")}`
+        );
+      }
 
-        const behind = git.commitsBehind(defaultBr);
-        if (parseInt(behind) > 0) {
-            console.log(pc.yellow(`📉 Status:      ${behind} commits behind ${defaultBr}`));
-        } else {
-            console.log(pc.dim(`✓ Up to date with ${defaultBr}`));
-        }
+      const headInfo = git.commitInfo("HEAD");
+      if (headInfo) {
+        console.log(
+          `${pc.blue("📍 HEAD".padEnd(13))} ` +
+            `${pc.dim(headInfo.hash)} ${pc.white(
+              headInfo.msg.substring(0, 40)
+            )} ${pc.dim("(" + headInfo.time + ")")}`
+        );
+      }
+
+      const behind = git.commitsBehind(defaultBr);
+      if (parseInt(behind) > 0) {
+        console.log(
+          pc.yellow(`📉 Status:      ${behind} commits behind ${defaultBr}`)
+        );
+      } else {
+        console.log(pc.dim(`✓ Up to date with ${defaultBr}`));
+      }
     }
   },
 };
@@ -241,38 +275,50 @@ async function generateCommit(diff) {
 // --- Flows ---
 
 async function checkForUpdates() {
-    if (!git.isRepo()) return;
+  if (!git.isRepo()) return;
 
-    // 1. Silent Fetch
-    try {
-        sh("git fetch", true); 
-    } catch { return; }
+  try {
+    sh("git fetch", true);
+  } catch {
+    return;
+  }
 
-    // 2. Check upstream status
-    const behind = git.upstreamBehindCount();
-    
-    // 3. Prompt if behind
-    if (behind > 0) {
-        const shouldPull = await confirm({
-            message: `Before proceeding, there're ${behind} new updates on repo. Pull them?`,
-        });
+  let behind = 0;
+  const current = git.branch();
+  const defaultBr = git.defaultBranch();
 
-        if (isCancel(shouldPull)) process.exit(0);
+  // Smart check: If on main, check against origin/main regardless of upstream config
+  if (
+    defaultBr &&
+    (current === "main" ||
+      current === "master" ||
+      current === defaultBr.replace("origin/", ""))
+  ) {
+    behind = parseInt(git.commitsBehind(defaultBr)) || 0;
+  } else {
+    behind = git.upstreamBehindCount();
+  }
 
-        if (shouldPull) {
-            const s = spinner();
-            s.start(pc.blue("🔄 Pulling latest changes..."));
-            try {
-                sh("git pull");
-                s.stop(pc.green("✔ Updated"));
-                // Refresh banner after pull
-                ui.banner();
-            } catch (e) {
-                s.stop(pc.red("✖ Pull Failed"));
-                note(e.message);
-            }
-        }
+  if (behind > 0) {
+    const shouldPull = await confirm({
+      message: `Your branch is behind by ${behind} commits. Pull them?`,
+    });
+
+    if (isCancel(shouldPull)) process.exit(0);
+
+    if (shouldPull) {
+      const s = spinner();
+      s.start(pc.blue("🔄 Pulling latest changes..."));
+      try {
+        sh(`git pull origin ${current}`);
+        s.stop(pc.green("✔ Updated"));
+        ui.banner();
+      } catch (e) {
+        s.stop(pc.red("✖ Pull Failed"));
+        note(e.message);
+      }
     }
+  }
 }
 
 async function flowUndo() {
@@ -314,7 +360,11 @@ async function flowUndo() {
     message: "How should we reset?",
     options: [
       { value: "--soft", label: "🧸 Soft Reset", hint: "Keep changes staged" },
-      { value: "--mixed", label: "🚧 Mixed Reset", hint: "Keep changes in working dir" },
+      {
+        value: "--mixed",
+        label: "🚧 Mixed Reset",
+        hint: "Keep changes in working dir",
+      },
       { value: "--hard", label: "🧨 Hard Reset", hint: "DESTROY changes" },
     ],
   });
@@ -341,26 +391,107 @@ async function flowUndo() {
   }
 }
 
+async function flowStash() {
+  if (!git.isRepo()) {
+    note("Not a git repository.", "Error");
+    return;
+  }
+
+  const action = await select({
+    message: "Stash Manager",
+    options: [
+      { value: "save", label: "💾 Save", hint: "Stash current changes" },
+      { value: "pop", label: "🥡 Pop", hint: "Apply saved stash" },
+    ],
+  });
+
+  if (isCancel(action)) return;
+
+  if (action === "save") {
+    try {
+      const msg = await text({
+        message: "Stash Message (Optional)",
+        placeholder: "WIP: Refactoring...",
+      });
+      if (isCancel(msg)) return;
+
+      const s = spinner();
+      s.start(pc.dim("Saving stash..."));
+      git.stashSave(msg || "Otto Stash");
+      s.stop(pc.green("✔ Stashed successfully"));
+    } catch (e) {
+      note(e.message, "⚠ Info");
+    }
+  }
+
+  if (action === "pop") {
+    const stashes = git.stashList();
+    if (stashes.length === 0) {
+      note("No stashes found.", "ℹ Empty");
+      return;
+    }
+
+    const target = await select({
+      message: "Select Stash to Pop",
+      options: stashes.map((s) => ({
+        value: s.ref,
+        label: s.msg,
+        hint: s.ref,
+      })),
+    });
+
+    if (isCancel(target)) return;
+
+    const s = spinner();
+    s.start(pc.dim(`Popping ${target}...`));
+    try {
+      sh(`git stash pop ${target}`);
+      s.stop(pc.green("✔ Popped successfully"));
+    } catch (e) {
+      s.stop(pc.red("✖ Pop resulted in conflicts"));
+      note(
+        "Changes are applied but there are merge conflicts. Resolve them manually.",
+        "⚠ Conflict"
+      );
+    }
+  }
+}
+
 async function flowSync() {
   if (!git.isRepo()) {
     note("Not a git repository.", "Error");
     return;
   }
-  
+
   const s = spinner();
   s.start(pc.blue("📡 Fetching origin..."));
-  
+
   try {
     sh("git fetch origin");
-    s.message(pc.blue("🔄 Pulling latest changes..."));
-    
     const curr = git.branch();
-    try {
-        sh(`git pull origin ${curr}`);
-    } catch {
-        sh("git pull");
+
+    // Check if branch exists on remote to avoid error
+    const remoteRef = sh(`git ls-remote --heads origin ${curr}`, true);
+
+    if (!remoteRef) {
+      s.stop(pc.yellow("⚠ No remote branch"));
+      note(
+        `Branch 'origin/${curr}' does not exist.\nPush your branch first to enable syncing.`,
+        "ℹ Info"
+      );
+      return;
     }
-    
+
+    s.message(pc.blue(`🔄 Pulling origin/${curr}...`));
+
+    // Explicitly pull from the remote matching current branch
+    sh(`git pull origin ${curr}`);
+
+    // Try to fix the upstream config for next time (silent)
+    try {
+      sh(`git branch --set-upstream-to=origin/${curr} ${curr}`, true);
+    } catch {}
+
     s.stop(pc.green("✔ Sync Complete"));
   } catch (e) {
     s.stop(pc.red("✖ Sync Failed"));
@@ -397,7 +528,12 @@ async function flowRelease() {
         }),
       ok: () => confirm({ message: "Start Build & Release?" }),
     },
-    { onCancel: () => { canceled = true; return; } }
+    {
+      onCancel: () => {
+        canceled = true;
+        return;
+      },
+    }
   );
 
   if (canceled || !config.ok) return;
@@ -409,12 +545,16 @@ async function flowRelease() {
     s.message(pc.dim("📦 Installing deps"));
     sh(`${PM} install`);
 
-    const hasBuild = sh(`node -p "require('./package.json').scripts?.build ? 'yes' : 'no'"`, true) === "yes";
+    const hasBuild =
+      sh(
+        `node -p "require('./package.json').scripts?.build ? 'yes' : 'no'"`,
+        true
+      ) === "yes";
 
     if (hasBuild) {
       s.message(pc.dim("🛠️  Building project"));
       sh(`${PM} run build`);
-    } 
+    }
 
     s.message(pc.dim("📝 Staging files"));
     sh("git add .");
@@ -430,24 +570,30 @@ async function flowRelease() {
 
   if (diff) {
     try {
-        const ai = await generateCommit(diff);
-        note(pc.italic(wrap(ai.desc, 60)), "📋 AI Summary");
+      const ai = await generateCommit(diff);
+      note(pc.italic(wrap(ai.desc, 60)), "📋 AI Summary");
 
-        const msg = await text({ message: "Commit Message", initialValue: ai.msg });
-        if (isCancel(msg)) return;
+      const msg = await text({
+        message: "Commit Message",
+        initialValue: ai.msg,
+      });
+      if (isCancel(msg)) return;
 
-        sh(`git commit -m "${String(msg).replace(/"/g, '\\"')}"`);
-        console.log(pc.green("✔ Committed"));
-        commitInfo = { msg: String(msg), desc: ai.desc };
-    } catch(e) {
-        note("AI Generation failed or commit aborted", "⚠ warning");
+      sh(`git commit -m "${String(msg).replace(/"/g, '\\"')}"`);
+      console.log(pc.green("✔ Committed"));
+      commitInfo = { msg: String(msg), desc: ai.desc };
+    } catch (e) {
+      note("AI Generation failed or commit aborted", "⚠ warning");
     }
   } else {
     note("No changes to commit", "ℹ Skip");
   }
 
   const rb = spinner();
-  const startMsg = config.type !== "none" ? `🔖 Bumping ${config.type}...` : "🚀 Preparing push...";
+  const startMsg =
+    config.type !== "none"
+      ? `🔖 Bumping ${config.type}...`
+      : "🚀 Preparing push...";
   rb.start(pc.blue(startMsg));
 
   try {
@@ -456,7 +602,10 @@ async function flowRelease() {
     }
 
     rb.message(pc.blue("🚀 Pushing to origin"));
-    const cmd = config.push === "force" ? "git push origin HEAD --force --tags" : "git push origin HEAD --tags";
+    const cmd =
+      config.push === "force"
+        ? "git push origin HEAD --force --tags"
+        : "git push origin HEAD --tags";
     sh(cmd);
 
     await logToSheet({
@@ -477,7 +626,9 @@ async function flowRelease() {
       }
       sh("git reset --soft HEAD~1");
       note("Tag deleted & commit reset.", "✅ Rollback");
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -509,14 +660,16 @@ async function flowBranch() {
   if (action === "switch") {
     const target = await select({
       message: "Select Branch",
-      options: branches.filter((b) => b !== curr).map((b) => ({ value: b, label: b })),
+      options: branches
+        .filter((b) => b !== curr)
+        .map((b) => ({ value: b, label: b })),
     });
     if (isCancel(target)) return;
 
     const s = spinner();
     s.start(pc.dim("Switching branches"));
     const stashed = git.stash();
-    
+
     try {
       sh(`git checkout ${target}`);
       s.message(pc.dim(`Switched to ${target}`));
@@ -551,13 +704,16 @@ async function flowBranch() {
   }
 
   if (action === "create") {
-    const name = await text({ message: "Branch Name", placeholder: "feat/new-thing" });
+    const name = await text({
+      message: "Branch Name",
+      placeholder: "feat/new-thing",
+    });
     if (isCancel(name)) return;
     try {
-        sh(`git checkout -b ${name}`);
-        note(`Checked out to ${name}`, "✔ Created");
-    } catch(e) {
-        note(e.message, "✖ Failed");
+      sh(`git checkout -b ${name}`);
+      note(`Checked out to ${name}`, "✔ Created");
+    } catch (e) {
+      note(e.message, "✖ Failed");
     }
   }
 
@@ -567,68 +723,83 @@ async function flowBranch() {
       .replace(":", "/")
       .replace("git@", "https://");
     const prUrl = `${url}/pull/new/${curr}`;
-    sh(process.platform === "darwin" ? `open ${prUrl}` : `start ${prUrl}`, true);
+    sh(
+      process.platform === "darwin" ? `open ${prUrl}` : `start ${prUrl}`,
+      true
+    );
     note("Opened PR in browser", "✔ PR");
   }
 }
 
 // --- Main Loop ---
 async function mainMenu() {
-    ui.banner(); // Show Banner
-    await checkForUpdates(); // Check & Prompt for pull (Smart Auto-Sync)
+  ui.banner();
+  await checkForUpdates();
 
-    while (true) {
-        const op = await select({
-            message: "What's the plan?",
-            options: [
-                { value: "release", label: "🚀 Release", hint: "Build, Tag, Push" },
-                { value: "branch", label: "🌿 Branch", hint: "Switch, Update, PR" },
-                { value: "undo", label: "⏪ Rollback", hint: "Rollback Commits using History" },
-                { value: "sync", label: "🔄 Sync", hint: "Fetch & Pull latest" },
-                { value: "quit", label: "🚪 Quit" },
-            ],
-        });
+  while (true) {
+    const op = await select({
+      message: "What's the plan?",
+      options: [
+        { value: "release", label: "🚀 Release", hint: "Build, Tag, Push" },
+        { value: "branch", label: "🌿 Branch", hint: "Switch, Update, PR" },
+        { value: "stash", label: "📦 Stash", hint: "Save & Pop Changes" },
+        { value: "undo", label: "⏪ Rollback", hint: "Rollback Commits" },
+        { value: "sync", label: "🔄 Sync", hint: "Fetch & Pull latest" },
+        { value: "quit", label: "🚪 Quit" },
+      ],
+    });
 
-        if (isCancel(op) || op === "quit") {
-            outro("👋 Bye!");
-            process.exit(0);
-        }
-
-        try {
-            if (op === "release") await flowRelease();
-            if (op === "branch") await flowBranch();
-            if (op === "undo") await flowUndo();
-            if (op === "sync") await flowSync();
-        } catch (e) {
-            note(e.message, "⚠ Unexpected Error");
-        }
-        
-        console.log("");
+    if (isCancel(op) || op === "quit") {
+      outro("👋 Bye!");
+      process.exit(0);
     }
+
+    try {
+      if (op === "release") await flowRelease();
+      if (op === "branch") await flowBranch();
+      if (op === "stash") await flowStash();
+      if (op === "undo") await flowUndo();
+      if (op === "sync") await flowSync();
+    } catch (e) {
+      note(e.message, "⚠ Unexpected Error");
+    }
+
+    console.log("");
+  }
 }
 
 // --- Entry Point ---
 const program = new Command();
-program.name("otto").description("AI-powered Release CLI").version("3.0.1");
+program.name("otto").description("AI-powered Release CLI").version("3.1.0");
 
 program.command("release").action(async () => {
   ui.banner();
+  await checkForUpdates();
   await flowRelease();
 });
 
 program.command("branch").action(async () => {
   ui.banner();
+  await checkForUpdates();
   await flowBranch();
+});
+
+program.command("stash").action(async () => {
+  ui.banner();
+  await checkForUpdates();
+  await flowStash();
 });
 
 program.command("undo").action(async () => {
   ui.banner();
+  await checkForUpdates();
   await flowUndo();
 });
 
 program.command("sync").action(async () => {
-    ui.banner();
-    await flowSync();
+  ui.banner();
+  await checkForUpdates();
+  await flowSync();
 });
 
 if (!process.argv.slice(2).length) {
