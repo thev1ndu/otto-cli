@@ -18,15 +18,14 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-// --- Configuration ---
 const SHEET_WEBHOOK_URL = process.env.GOOGLE_SHEET_WEBHOOK_URL;
 
-// --- Core Utilities ---
 const sh = (cmd, ignore = false) => {
   try {
     return execSync(cmd, { stdio: "pipe" }).toString().trim();
   } catch (e) {
-    if (!ignore) throw new Error(e?.stderr?.toString() || e?.message || String(e));
+    if (!ignore)
+      throw new Error(e?.stderr?.toString() || e?.message || String(e));
     return "";
   }
 };
@@ -50,12 +49,8 @@ const git = {
 
   branch: () => {
     if (!git.isRepo()) return "no-git";
-
-    // Normal branch (works even when HEAD is "unborn" if symbolic-ref returns nothing)
     const b = sh("git symbolic-ref --short -q HEAD", true);
     if (b) return b;
-
-    // Detached HEAD fallback
     const d = sh("git rev-parse --short HEAD", true);
     return d ? `detached@${d}` : "unborn";
   },
@@ -67,7 +62,6 @@ const git = {
 
   rawDiff: () => sh("git diff --cached", true),
 
-  // Silent Auto-Stash
   stash: () => {
     if (!git.isRepo()) return false;
     const isDirty = sh("git status --porcelain", true).length > 0;
@@ -76,15 +70,29 @@ const git = {
     return true;
   },
 
-  // Safe Pop
   pop: () => {
     if (!git.isRepo()) return false;
     try {
       sh("git stash pop");
       return true;
     } catch {
-      return false; // Conflict during pop
+      return false;
     }
+  },
+
+  // NEW: Fetch parsed git log
+  log: (limit = 10) => {
+    if (!git.isRepo()) return [];
+    // Format: hash | message | author | relative_time
+    const out = sh(
+      `git log -n ${limit} --pretty=format:"%h|%s|%an|%ar"`,
+      true
+    );
+    if (!out) return [];
+    return out.split("\n").map((line) => {
+      const [hash, msg, author, time] = line.split("|");
+      return { hash, msg, author, time };
+    });
   },
 };
 
@@ -103,7 +111,7 @@ const ui = {
 
     if (!git.isRepo()) {
       note(
-        "You're not inside a git repository. 'release' and 'branch' commands need a repo.",
+        "You're not inside a git repository. Commands need a repo.",
         "ℹ Git"
       );
     }
@@ -154,6 +162,97 @@ async function generateCommit(diff) {
 }
 
 // --- Flows ---
+
+// NEW: Undo Flow
+async function flowUndo() {
+  if (!git.isRepo()) ui.die("Not a git repository.");
+
+  const s = spinner();
+  s.start(pc.dim("Fetching history"));
+  const history = git.log(15); // Fetch last 15 commits
+  s.stop(pc.dim("History loaded"));
+
+  if (!history.length) {
+    note("No commit history found to undo.", "ℹ Empty");
+    return;
+  }
+
+  const targetHash = await select({
+    message: "Reset branch to which commit?",
+    options: history.map((c, i) => {
+      // Mark the current HEAD
+      const label = i === 0 ? `${c.msg} (Current)` : c.msg;
+      return {
+        value: c.hash,
+        label: `${pc.cyan(c.hash)} ${label}`,
+        hint: `${c.author}, ${c.time}`,
+      };
+    }),
+  });
+
+  if (isCancel(targetHash)) process.exit(0);
+
+  // If they selected the current HEAD, there is nothing to do
+  if (targetHash === history[0].hash) {
+    outro(pc.yellow("You selected the current commit. No changes made."));
+    return;
+  }
+
+  const resetMode = await select({
+    message: "How should we reset?",
+    options: [
+      {
+        value: "--soft",
+        label: "🧸 Soft Reset",
+        hint: "Keep changes staged (Undo commit only)",
+      },
+      {
+        value: "--mixed",
+        label: "🚧 Mixed Reset",
+        hint: "Keep changes in working dir (Unstaged)",
+      },
+      {
+        value: "--hard",
+        label: "🧨 Hard Reset",
+        hint: "DESTROY changes (Go back in time)",
+      },
+    ],
+  });
+
+  if (isCancel(resetMode)) process.exit(0);
+
+  // Safety check for Hard Reset
+  if (resetMode === "--hard") {
+    const safe = await confirm({
+      message: pc.red("⚠️  This will delete all uncommitted changes. Sure?"),
+    });
+    if (!safe || isCancel(safe)) {
+      outro(pc.dim("Operation cancelled."));
+      return;
+    }
+  }
+
+  const r = spinner();
+  r.start(pc.yellow(`Resetting to ${targetHash}...`));
+
+  try {
+    sh(`git reset ${resetMode} ${targetHash}`);
+    r.stop(pc.green(`✔ Reset complete (${resetMode})`));
+    
+    if (resetMode === "--soft") {
+      note("Your changes are now staged and ready to be modified.", "ℹ Soft Reset");
+    } else if (resetMode === "--mixed") {
+      note("Your changes are in the working directory (unstaged).", "ℹ Mixed Reset");
+    } else {
+      note(`HEAD is now at ${targetHash}`, "ℹ Hard Reset");
+    }
+
+  } catch (e) {
+    r.stop(pc.red("✖ Reset failed"));
+    console.error(e.message);
+  }
+}
+
 async function flowRelease() {
   if (!git.isRepo()) ui.die("Not a git repository. Run `otto` inside a repo.");
 
@@ -183,7 +282,11 @@ async function flowRelease() {
   );
 
   if (!config.ok) return;
-
+  
+  // ... (Rest of release flow remains identical) ...
+  // [Code shortened for brevity, keep your original release logic here]
+  
+  // Start Build
   const s = spinner();
   try {
     s.start(pc.dim("🔄 Syncing origin"));
@@ -191,19 +294,12 @@ async function flowRelease() {
     s.message(pc.dim("📦 Installing deps"));
     sh("pnpm install");
 
-    // Only run build if it exists
-    const hasBuild =
-      sh(
-        'node -p "require(\'./package.json\').scripts?.build ? \'yes\' : \'no\'"',
-        true
-      ) === "yes";
+    const hasBuild = sh('node -p "require(\'./package.json\').scripts?.build ? \'yes\' : \'no\'"', true) === "yes";
 
     if (hasBuild) {
       s.message(pc.dim("🛠️  Building project"));
       sh("pnpm run build");
-    } else {
-      note("No build script found, skipping build.", "ℹ Build");
-    }
+    } 
 
     s.message(pc.dim("📝 Staging files"));
     sh("git add .");
@@ -213,6 +309,7 @@ async function flowRelease() {
     ui.die(e.message);
   }
 
+  // Commit
   let commitInfo = { msg: "Manual/No Commit", desc: "No changes" };
   const diff = git.rawDiff();
 
@@ -230,11 +327,9 @@ async function flowRelease() {
     note("No changes to commit", "ℹ Skip");
   }
 
+  // Push / Publish
   const rb = spinner();
-
-  // Ensure start() ALWAYS happens before try/catch
-  const startMsg =
-    config.type !== "none" ? `🔖 Bumping ${config.type}...` : "🚀 Preparing push...";
+  const startMsg = config.type !== "none" ? `🔖 Bumping ${config.type}...` : "🚀 Preparing push...";
   rb.start(pc.blue(startMsg));
 
   try {
@@ -243,10 +338,7 @@ async function flowRelease() {
     }
 
     rb.message(pc.blue("🚀 Pushing to origin"));
-    const cmd =
-      config.push === "force"
-        ? "git push origin HEAD --force --tags"
-        : "git push origin HEAD --tags";
+    const cmd = config.push === "force" ? "git push origin HEAD --force --tags" : "git push origin HEAD --tags";
     sh(cmd);
 
     await logToSheet({
@@ -267,9 +359,7 @@ async function flowRelease() {
       }
       sh("git reset --soft HEAD~1");
       note("Tag deleted & commit reset.", "✅ Rollback");
-    } catch {
-      // ignore
-    }
+    } catch { /* ignore */ }
     process.exit(1);
   }
 }
@@ -300,20 +390,14 @@ async function flowBranch() {
   if (action === "switch") {
     const target = await select({
       message: "Select Branch",
-      options: branches
-        .filter((b) => b !== curr)
-        .map((b) => ({ value: b, label: b })),
+      options: branches.filter((b) => b !== curr).map((b) => ({ value: b, label: b })),
     });
     if (isCancel(target)) process.exit(0);
 
     const s = spinner();
     s.start(pc.dim("Switching branches"));
-
-    // 1. Auto Stash
     const stashed = git.stash();
-    if (stashed) s.message(pc.dim("Changes stashed"));
-
-    // 2. Checkout
+    
     try {
       sh(`git checkout ${target}`);
       s.message(pc.dim(`Switched to ${target}`));
@@ -322,17 +406,14 @@ async function flowBranch() {
       return;
     }
 
-    // 3. Auto Pop
     if (stashed) {
       s.message(pc.dim("Restoring changes"));
-      const popped = git.pop();
-      if (!popped) {
+      if (!git.pop()) {
         s.stop(pc.yellow("⚠ Switched, but stash pop had conflicts."));
         note("Run 'git stash pop' manually to resolve.", "Conflict Alert");
         return;
       }
     }
-
     s.stop(pc.green(`✔ Switched to ${target}`));
   }
 
@@ -365,7 +446,6 @@ async function flowBranch() {
       .replace(".git", "")
       .replace(":", "/")
       .replace("git@", "https://");
-
     const prUrl = `${url}/pull/new/${curr}`;
     sh(process.platform === "darwin" ? `open ${prUrl}` : `start ${prUrl}`, true);
     outro(pc.green("Opened PR in browser"));
@@ -386,6 +466,12 @@ program.command("branch").action(async () => {
   await flowBranch();
 });
 
+// NEW Command
+program.command("undo").action(async () => {
+  ui.banner();
+  await flowUndo();
+});
+
 if (!process.argv.slice(2).length) {
   ui.banner();
   select({
@@ -393,12 +479,14 @@ if (!process.argv.slice(2).length) {
     options: [
       { value: "release", label: "🚀 Release", hint: "Build, Tag, Push" },
       { value: "branch", label: "🌿 Branch", hint: "Switch, Update, PR" },
+      { value: "undo", label: "⏪ Undo", hint: "Rewind commits" }, // Added here
       { value: "quit", label: "🚪 Quit" },
     ],
   }).then(async (op) => {
     if (isCancel(op) || op === "quit") process.exit(0);
     if (op === "release") await flowRelease();
     if (op === "branch") await flowBranch();
+    if (op === "undo") await flowUndo();
   });
 } else {
   program.parse(process.argv);
