@@ -1,0 +1,34 @@
+{
+    "name": "otto-cli",
+    "version": "2.1.0",
+    "description": "AI-powered release & branch management CLI",
+    "type": "module",
+    "bin": {
+      "otto": "./bin/otto.js",
+      "start": "node ./bin/otto.js"
+    },
+    "engines": {
+      "node": ">=18"
+    },
+    "keywords": [
+      "cli",
+      "git",
+      "release",
+      "automation",
+      "ai",
+      "openai"
+    ],
+    "author": "thev1ndu",
+    "license": "MIT",
+    "files": [
+      "bin"
+    ],
+    "dependencies": {
+      "@clack/prompts": "^0.7.0",
+      "commander": "^11.0.0",
+      "dotenv": "^16.4.0",
+      "openai": "^4.0.0",
+      "picocolors": "^1.0.0"
+    }
+  }
+  
