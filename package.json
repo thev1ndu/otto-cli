@@ -1,6 +1,6 @@
 {
   "name": "otto-cli",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "AI-powered Release CLI",
   "main": "index.js",
   "type": "module",
